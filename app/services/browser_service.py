@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import struct
 import zipfile
 from dataclasses import dataclass, replace
@@ -11,9 +12,9 @@ from pathlib import Path
 from secrets import token_urlsafe
 from typing import Any, TYPE_CHECKING
 
+import websockets
+
 from PySide6.QtCore import QObject, QResource, QTimer, QVersionNumber, Signal, Slot
-from PySide6.QtNetwork import QHostAddress
-from PySide6.QtWebSockets import QWebSocketServer
 from loguru import logger
 
 from app.config.cfg import cfg
@@ -23,7 +24,6 @@ from app.config.paths import APP_DATA_DIR
 from app.models.task import MergeTaskOptions, PageTaskOptions
 
 if TYPE_CHECKING:
-    from PySide6.QtWebSockets import QWebSocket
     from app.models.task import Task, TaskOptions, ResourceTaskOptions
 
 EXTENSION_UNPACK_DIR = Path(APP_DATA_DIR) / "browser_extension"
@@ -49,7 +49,7 @@ async def extractBrowserExtension() -> Path:
 
 @dataclass
 class BrowserClientSession:
-    socket: QWebSocket
+    ws: object
     isAuthenticated: bool = False
     isSubscribedToTasks: bool = False
     lastSnapshot: str | None = None
@@ -120,22 +120,26 @@ class BrowserService(QObject):
     connectionChanged = Signal()
     protocolMismatched = Signal()
 
+    _wsConnected = Signal(object)
+    _wsDisconnected = Signal(object)
+    _wsMessageReceived = Signal(object, str)
+
     def __init__(self, coroutineRunner, taskService, parse, parent=None):
         super().__init__(parent)
         self._coroutineRunner = coroutineRunner
         self._taskService = taskService
         self._parse = parse
-        self._server = QWebSocketServer(
-            "Ghost Downloader Browser Socket Server",
-            QWebSocketServer.SslMode.NonSecureMode,
-            self,
-        )
-        self._server.newConnection.connect(self._onNewConnection)
-        self._sessions: dict[int, BrowserClientSession] = {}
+        self._serveWorkId: str | None = None
+        self._boundPort = 0
+        self._sessions: dict[object, BrowserClientSession] = {}
         self._snapshotTimer = QTimer(self)
         self._snapshotTimer.setInterval(1000)
         self._snapshotTimer.timeout.connect(self._broadcastSnapshots)
         self._isUpdatingExtension = False
+
+        self._wsConnected.connect(self._onWsConnected)
+        self._wsDisconnected.connect(self._onWsDisconnected)
+        self._wsMessageReceived.connect(self._onWsMessageReceived)
 
     @property
     def token(self) -> str:
@@ -145,7 +149,7 @@ class BrowserService(QObject):
 
     @property
     def boundPort(self) -> int:
-        return self._server.serverPort() if self._server.isListening() else 0
+        return self._boundPort
 
     @property
     def connectionSummary(self) -> tuple[str, str]:
@@ -161,21 +165,32 @@ class BrowserService(QObject):
         return token
 
     def start(self) -> None:
-        if self._server.isListening():
+        if self._serveWorkId is not None:
             return
         port = cfg.browserExtensionPort.value
-        if self._server.listen(QHostAddress.SpecialAddress.LocalHost, port):
-            logger.info("Browser extension server started on port {}", port)
-            self._snapshotTimer.start()
-        else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(('127.0.0.1', port))
+            sock.listen()
+        except OSError as e:
             logger.error("Failed to start browser extension server on port {}: {}",
-                         port, self._server.errorString())
+                         port, e)
+            sock.close()
+            return
+        sock.setblocking(False)
+        self._boundPort = sock.getsockname()[1]
+        self._serveWorkId = self._coroutineRunner.submit(self._run(sock))
+        logger.info("Browser extension server started on port {}", self._boundPort)
+        self._snapshotTimer.start()
 
     def stop(self) -> None:
-        self._closeAll()
         self._snapshotTimer.stop()
-        if self._server.isListening():
-            self._server.close()
+        self._closeAll()
+        if self._serveWorkId is not None:
+            self._coroutineRunner.cancel(self._serveWorkId)
+            self._serveWorkId = None
+        self._boundPort = 0
 
     def setEnabled(self, enabled: bool) -> None:
         if enabled:
@@ -199,6 +214,18 @@ class BrowserService(QObject):
             "ok": False,
             "message": "已拒绝配对请求",
         })
+
+    async def _run(self, sock: socket.socket) -> None:
+        async with websockets.serve(self._onConnection, sock=sock):
+            await asyncio.Future()
+
+    async def _onConnection(self, ws) -> None:
+        self._wsConnected.emit(ws)
+        try:
+            async for message in ws:
+                self._wsMessageReceived.emit(ws, message)
+        finally:
+            self._wsDisconnected.emit(ws)
 
     def _toResourceTaskOptions(self, resource: dict) -> ResourceTaskOptions:
         from app.models.task import ResourceTaskOptions
@@ -268,22 +295,15 @@ class BrowserService(QObject):
     def _closeAll(self) -> None:
         hadAuthenticated = any(s.isAuthenticated for s in self._sessions.values())
         for session in list(self._sessions.values()):
-            session.socket.close()
-            self._deleteSocket(session.socket)
+            self._coroutineRunner.submit(session.ws.close())
         self._sessions.clear()
         if hadAuthenticated:
             self.connectionChanged.emit()
 
-    def _deleteSocket(self, socket: QWebSocket) -> None:
-        try:
-            socket.disconnected.disconnect(self._onDisconnected)
-        except (RuntimeError, TypeError):
-            pass
-        socket.deleteLater()
-
     def _send(self, session: BrowserClientSession, payload: dict) -> None:
         try:
-            session.socket.sendTextMessage(json.dumps(payload, ensure_ascii=False))
+            data = json.dumps(payload, ensure_ascii=False)
+            self._coroutineRunner.submit(session.ws.send(data))
         except Exception as e:
             logger.opt(exception=e).warning("Failed to send browser payload")
 
@@ -317,24 +337,16 @@ class BrowserService(QObject):
             payload["message"] = message
         self._send(session, payload)
 
-    @Slot()
-    def _onNewConnection(self) -> None:
-        socket = self._server.nextPendingConnection()
-        if socket is None:
-            return
-        self._sessions[id(socket)] = BrowserClientSession(socket=socket)
-        socket.textMessageReceived.connect(self._onMessage)
-        socket.disconnected.connect(self._onDisconnected)
+    @Slot(object)
+    def _onWsConnected(self, ws) -> None:
+        self._sessions[ws] = BrowserClientSession(ws=ws)
 
-    @Slot()
-    def _onDisconnected(self) -> None:
-        socket: QWebSocket = self.sender()
-        if not socket:
+    @Slot(object)
+    def _onWsDisconnected(self, ws) -> None:
+        session = self._sessions.pop(ws, None)
+        if session is None:
             return
-        session = self._sessions.pop(id(socket), None)
-        wasAuthenticated = session.isAuthenticated if session else False
-        self._deleteSocket(socket)
-        if wasAuthenticated:
+        if session.isAuthenticated:
             self.connectionChanged.emit()
 
     @Slot()
@@ -354,14 +366,13 @@ class BrowserService(QObject):
                 continue
             session.lastSnapshot = snapshot
             try:
-                session.socket.sendTextMessage(snapshot)
+                self._coroutineRunner.submit(session.ws.send(snapshot))
             except Exception as e:
                 logger.opt(exception=e).warning("Failed to push task snapshot")
 
-    @Slot(str)
-    def _onMessage(self, message: str) -> None:
-        socket: QWebSocket = self.sender()
-        session = self._sessions.get(id(socket)) if socket else None
+    @Slot(object, str)
+    def _onWsMessageReceived(self, ws, message: str) -> None:
+        session = self._sessions.get(ws)
         if session is None:
             return
 
@@ -383,11 +394,12 @@ class BrowserService(QObject):
             return
 
         if msgType == MessageType.PAIR_REQUEST:
+            peerAddress = f"{session.ws.remote_address[0]}:{session.ws.remote_address[1]}"
             self.pairRequested.emit({
                 "session": session,
                 "requestId": toStr(data, "requestId"),
                 "protocolVersion": data.get("protocolVersion"),
-                "peerAddress": f"{session.socket.peerAddress().toString()}:{session.socket.peerPort()}",
+                "peerAddress": peerAddress,
                 "extensionVersion": toStr(data, "extensionVersion"),
                 "clientKind": toStr(data, "clientKind"),
             })
@@ -399,7 +411,7 @@ class BrowserService(QObject):
 
         if not session.isAuthenticated:
             self._sendError(session, "请先完成握手认证", code=ErrorCode.UNAUTHORIZED)
-            session.socket.close()
+            self._coroutineRunner.submit(session.ws.close())
             return
 
         if msgType == MessageType.SUBSCRIBE_TASKS:
@@ -416,13 +428,13 @@ class BrowserService(QObject):
 
         if toInt(data, "protocolVersion", 0) != PROTOCOL_VERSION:
             self._sendError(session, "协议版本不匹配", requestId=requestId, code=ErrorCode.PROTOCOL_MISMATCH)
-            session.socket.close()
+            self._coroutineRunner.submit(session.ws.close())
             self.protocolMismatched.emit()
             return
 
         if toStr(data, "token") != self.token:
             self._sendError(session, "配对令牌无效", requestId=requestId, code=ErrorCode.UNAUTHORIZED)
-            session.socket.close()
+            self._coroutineRunner.submit(session.ws.close())
             return
 
         session.isAuthenticated = True
@@ -453,7 +465,7 @@ class BrowserService(QObject):
             )
 
     def _onExtensionExtracted(self, _path: Path, session: BrowserClientSession) -> None:
-        if id(session.socket) not in self._sessions:
+        if session.ws not in self._sessions:
             return
         self._send(session, {"type": MessageType.RELOAD})
         self.extensionUpdated.emit(LATEST_EXTENSION_VERSION)
@@ -468,7 +480,7 @@ class BrowserService(QObject):
         payload = data.get("payload")
         rawSource = toStr(data, "source", TaskSource.RESOURCE)
         title = toStr(data, "title")
-        draft = data.get("draft")  # None = not present (auto-intercept / old extension)
+        draft = data.get("draft")
 
         if not requestId or not isinstance(payload, dict):
             self._sendError(session, "无效的请求")
@@ -591,5 +603,3 @@ class BrowserService(QObject):
         except Exception as e:
             logger.opt(exception=e).error("Browser task action failed")
             self._sendResult(session, MessageType.TASK_ACTION_RESULT, requestId, ok=False, message=repr(e))
-
-
