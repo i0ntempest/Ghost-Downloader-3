@@ -380,14 +380,19 @@ class YtDlpDraftCard(DraftCard):
         self._autoLangs: set[str] = set()
         self._audioLanguageChoices: list[tuple[str, str]] = []
 
+        self._audioLanguageButton = TrackButton(FluentIcon.MICROPHONE, self._trackBar)
+        self._audioLanguageButton.setToolTip(self.tr("音频语言"))
+        barLayout = self._trackBar.layout()
+        barLayout.insertWidget(barLayout.indexOf(self._trackBar.audioButton) + 1, self._audioLanguageButton)
+
         if hasMediaInfo:
             self._trackBar.videoButton.setOptions(buildVideoTiers(mediaInfo, self.tr("最佳画质")))
             self._trackBar.audioButton.setOptions(buildAudioTiers(mediaInfo, self.tr("最佳音质")))
             self._audioLanguageChoices = buildAudioLanguageChoices(mediaInfo)
-            self._trackBar.audioLanguageButton.setTrackEnabled(bool(self._audioLanguageChoices))
+            self._audioLanguageButton.setTrackEnabled(bool(self._audioLanguageChoices))
             if self._audioLanguageChoices and not task.audioLanguages:
                 task.audioLanguages = self._audioLanguageChoices[0][0]
-                self._trackBar.audioLanguageButton.setChecked(True)
+                self._audioLanguageButton.setChecked(True)
             choices, autoLangs = buildSubtitleChoices(mediaInfo, self.tr("自动"))
             self._subtitleChoices = choices
             self._autoLangs = autoLangs
@@ -399,7 +404,7 @@ class YtDlpDraftCard(DraftCard):
         else:
             self._trackBar.videoButton.setOptions([("0", self.tr("最佳画质"))])
             self._trackBar.audioButton.setOptions([("0", self.tr("最佳音质"))])
-            self._trackBar.audioLanguageButton.setTrackEnabled(False)
+            self._audioLanguageButton.setTrackEnabled(False)
             self._trackBar.subtitleButton.setTrackEnabled(False)
             self._trackBar.coverButton.setTrackEnabled(False)
             self._trackBar.spinner.show()
@@ -447,7 +452,7 @@ class YtDlpDraftCard(DraftCard):
         self._trackBar.videoButton.toggled.connect(self._onTrackToggled)
         self._trackBar.audioButton.optionPicked.connect(self._onAudioQualityPicked)
         self._trackBar.audioButton.toggled.connect(self._onTrackToggled)
-        self._trackBar.audioLanguageButton.clicked.connect(self._onAudioLanguageClicked)
+        self._audioLanguageButton.clicked.connect(self._onAudioLanguageClicked)
         self._trackBar.subtitleButton.clicked.connect(self._onSubtitleClicked)
         self._trackBar.coverButton.clicked.connect(
             lambda: self._trackBar.coverButton.setChecked(not self._trackBar.coverButton.isChecked())
@@ -475,9 +480,9 @@ class YtDlpDraftCard(DraftCard):
 
         hasMedia = task.isVideoEnabled or task.isAudioEnabled
         audioLangEnabled = task.isAudioEnabled and bool(self._audioLanguageChoices)
-        self._trackBar.audioLanguageButton.setTrackEnabled(audioLangEnabled)
+        self._audioLanguageButton.setTrackEnabled(audioLangEnabled)
         if audioLangEnabled:
-            self._trackBar.audioLanguageButton.setChecked(bool(task.audioLanguages.strip()))
+            self._audioLanguageButton.setChecked(bool(task.audioLanguages.strip()))
         subtitleEnabled = hasMedia and bool(self._subtitleChoices)
         self._trackBar.subtitleButton.setTrackEnabled(subtitleEnabled)
         if subtitleEnabled:
@@ -533,7 +538,7 @@ class YtDlpDraftCard(DraftCard):
             if dialog.exec():
                 selected = dialog.selectedLanguages()
                 self._task.audioLanguages = ",".join(selected)
-                self._trackBar.audioLanguageButton.setChecked(bool(selected))
+                self._audioLanguageButton.setChecked(bool(selected))
                 self._refreshSummary()
         finally:
             dialog.deleteLater()
@@ -573,10 +578,10 @@ class YtDlpDraftCard(DraftCard):
         self._trackBar.videoButton.setOptions(buildVideoTiers(mediaInfo, self.tr("最佳画质")))
         self._trackBar.audioButton.setOptions(buildAudioTiers(mediaInfo, self.tr("最佳音质")))
         self._audioLanguageChoices = buildAudioLanguageChoices(mediaInfo)
-        self._trackBar.audioLanguageButton.setTrackEnabled(bool(self._audioLanguageChoices))
+        self._audioLanguageButton.setTrackEnabled(bool(self._audioLanguageChoices))
         if self._audioLanguageChoices and not task.audioLanguages:
             task.audioLanguages = self._audioLanguageChoices[0][0]
-            self._trackBar.audioLanguageButton.setChecked(True)
+            self._audioLanguageButton.setChecked(True)
 
         choices, autoLangs = buildSubtitleChoices(mediaInfo, self.tr("自动"))
         self._subtitleChoices = choices
