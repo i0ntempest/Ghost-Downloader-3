@@ -46,7 +46,8 @@ class Aria2RpcServer(QObject):
             sock.close()
             return
         sock.setblocking(False)
-        self._serveWorkId = self._coroutineRunner.submit(self._run(sock))
+        self._serveWorkId = self._coroutineRunner.submit(
+            self._run(sock), failed=self._onServeFailed)
         logger.info("Aria2 RPC compat server started on port {}", port)
 
     def stop(self) -> None:
@@ -55,6 +56,10 @@ class Aria2RpcServer(QObject):
         self._coroutineRunner.cancel(self._serveWorkId)
         self._serveWorkId = None
 
+    def _onServeFailed(self, error) -> None:
+        self._serveWorkId = None
+        logger.error("Aria2 RPC compat server crashed: {}", error)
+
     def setEnabled(self, enabled: bool) -> None:
         if enabled:
             self.start()
@@ -62,7 +67,11 @@ class Aria2RpcServer(QObject):
             self.stop()
 
     async def _run(self, sock: socket.socket) -> None:
-        server = await asyncio.start_server(self._onConnection, sock=sock)
+        try:
+            server = await asyncio.start_server(self._onConnection, sock=sock)
+        except Exception:
+            sock.close()
+            raise
         async with server:
             await server.serve_forever()
 
@@ -75,59 +84,62 @@ class Aria2RpcServer(QObject):
                     contentLength = int(line.split(b":", 1)[1].strip())
                     break
             body = await reader.readexactly(contentLength)
-            self._dispatchRpc(writer, body)
+            response = self._dispatchRpc(body)
+            payload = json.dumps(response, ensure_ascii=False).encode("utf-8")
+            httpHeader = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Content-Length: {len(payload)}\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode("utf-8")
+            writer.write(httpHeader + payload)
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ValueError):
             pass
         finally:
             writer.close()
             await writer.wait_closed()
 
-    def _dispatchRpc(self, writer: asyncio.StreamWriter, body: bytes) -> None:
+    def _dispatchRpc(self, body: bytes) -> dict:
         try:
             data = json.loads(body)
         except Exception:
-            self._respondError(writer, None, JSONRPC_PARSE_ERROR, "Parse error")
-            return
+            return {"jsonrpc": "2.0", "id": None, "error": {"code": JSONRPC_PARSE_ERROR, "message": "Parse error"}}
 
         if not isinstance(data, dict):
-            self._respondError(writer, None, JSONRPC_INVALID_REQUEST, "Invalid Request")
-            return
+            return {"jsonrpc": "2.0", "id": None, "error": {"code": JSONRPC_INVALID_REQUEST, "message": "Invalid Request"}}
 
         rpcId = data.get("id")
         method = data.get("method", "")
         params = data.get("params", [])
 
         if not isinstance(params, list):
-            self._respondError(writer, rpcId, JSONRPC_INVALID_REQUEST, "params must be array")
-            return
+            return {"jsonrpc": "2.0", "id": rpcId, "error": {"code": JSONRPC_INVALID_REQUEST, "message": "params must be array"}}
 
         token = cfg.aria2RpcToken.value
         if token:
             if params and isinstance(params[0], str) and params[0].startswith("token:"):
                 if params[0] != f"token:{token}":
-                    self._respondError(writer, rpcId, 1, "Unauthorized")
-                    return
+                    return {"jsonrpc": "2.0", "id": rpcId, "error": {"code": 1, "message": "Unauthorized"}}
                 params = params[1:]
             else:
-                self._respondError(writer, rpcId, 1, "Unauthorized")
-                return
+                return {"jsonrpc": "2.0", "id": rpcId, "error": {"code": 1, "message": "Unauthorized"}}
         elif params and isinstance(params[0], str) and params[0].startswith("token:"):
             params = params[1:]
 
         if method == "aria2.addUri":
-            self._addUri(writer, rpcId, params)
+            return self._addUri(rpcId, params)
         elif method == "aria2.getVersion":
-            self._respond(writer, rpcId, {"version": VERSION, "enabledFeatures": ["HTTPS"]})
+            return {"jsonrpc": "2.0", "id": rpcId, "result": {"version": VERSION, "enabledFeatures": ["HTTPS"]}}
         else:
-            self._respondError(writer, rpcId, JSONRPC_METHOD_NOT_FOUND, "Method not found")
+            return {"jsonrpc": "2.0", "id": rpcId, "error": {"code": JSONRPC_METHOD_NOT_FOUND, "message": "Method not found"}}
 
-    def _addUri(self, writer: asyncio.StreamWriter, rpcId: Any, params: list) -> None:
+    def _addUri(self, rpcId: Any, params: list) -> dict:
         uris = params[0] if params and isinstance(params[0], list) else []
         options = params[1] if len(params) > 1 and isinstance(params[1], dict) else {}
 
         if not uris:
-            self._respondError(writer, rpcId, 1, "No URI provided")
-            return
+            return {"jsonrpc": "2.0", "id": rpcId, "error": {"code": 1, "message": "No URI provided"}}
 
         url = uris[0]
         filename = options.get("out", "")
@@ -151,7 +163,6 @@ class Aria2RpcServer(QObject):
             headers.setdefault("Referer", referer)
 
         gid = token_hex(8)
-        self._respond(writer, rpcId, gid)
 
         from app.models.task import TaskOptions
 
@@ -169,6 +180,8 @@ class Aria2RpcServer(QObject):
             failed=self._onTaskParseFailed,
         )
 
+        return {"jsonrpc": "2.0", "id": rpcId, "result": gid}
+
     def _onTaskParsed(self, task: Task, filename: str = "") -> None:
         if filename:
             task.setName(filename)
@@ -181,20 +194,3 @@ class Aria2RpcServer(QObject):
 
     def _onTaskParseFailed(self, error: str) -> None:
         logger.warning("Aria2 RPC task parse failed: {}", error)
-
-    def _respond(self, writer: asyncio.StreamWriter, rpcId: Any, result: Any) -> None:
-        self._sendJson(writer, {"jsonrpc": "2.0", "id": rpcId, "result": result})
-
-    def _respondError(self, writer: asyncio.StreamWriter, rpcId: Any, code: int, message: str) -> None:
-        self._sendJson(writer, {"jsonrpc": "2.0", "id": rpcId, "error": {"code": code, "message": message}})
-
-    def _sendJson(self, writer: asyncio.StreamWriter, payload: dict) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        header = (
-            f"HTTP/1.1 200 OK\r\n"
-            f"Content-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            f"Connection: close\r\n"
-            f"\r\n"
-        ).encode("utf-8")
-        writer.write(header + body)

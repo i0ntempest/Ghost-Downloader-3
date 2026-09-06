@@ -113,16 +113,80 @@ def toInt(data: dict, key: str, default: int) -> int:
     return value if isinstance(value, int) and value > 0 else default
 
 
+def toResourceTaskOptions(resource: dict) -> ResourceTaskOptions:
+    from app.models.task import ResourceTaskOptions
+    hdrs = resource.get("headers") or {}
+    return ResourceTaskOptions(
+        url=toStr(resource, "url"),
+        name=toStr(resource, "filename"),
+        size=toInt(resource, "size", 0),
+        canUseRangeRequests=bool(resource.get("supportsRange")),
+        headers=hdrs,
+        sourceUserAgent=hdrs.get("user-agent", ""),
+    )
+
+
+def toTaskOptions(source: TaskSource, payload: dict) -> TaskOptions:
+    rawPath = payload.get("path")
+    outputFolder = Path(rawPath) if rawPath else Path(cfg.downloadFolder.value)
+
+    match source:
+        case TaskSource.RESOURCE_MERGE:
+            resources = payload.get("resources") or []
+            video = toResourceTaskOptions(resources[0]) if len(resources) > 0 else None
+            audio = toResourceTaskOptions(resources[1]) if len(resources) > 1 else None
+            return MergeTaskOptions(
+                url=video.url if video else "",
+                outputFolder=outputFolder,
+                video=video,
+                audio=audio,
+            )
+        case TaskSource.PAGE_MEDIA:
+            hdrs = payload.get("headers") or {}
+            return PageTaskOptions(
+                url=toStr(payload, "url"),
+                outputFolder=outputFolder,
+                pageUrl=toStr(payload, "pageUrl"),
+                pageTitle=toStr(payload, "pageTitle"),
+                headers=hdrs,
+                sourceUserAgent=hdrs.get("user-agent", ""),
+            )
+        case TaskSource.RESOURCE | TaskSource.DOWNLOAD:
+            return replace(
+                toResourceTaskOptions(payload),
+                outputFolder=outputFolder,
+                subworkerCount=toInt(payload, "preBlockNum", cfg.preBlockNum.value),
+            )
+        case _:
+            raise ValueError(f"unsupported task source: {source}")
+
+
+def toTaskSummary(task: Task) -> dict:
+    progress, speed, receivedBytes = task.currentSnapshot()
+    outputPath = Path(task.outputPath)
+    return {
+        "taskId": task.taskId,
+        "name": task.name,
+        "status": task.status.name.lower(),
+        "progress": round(progress, 2),
+        "receivedBytes": receivedBytes,
+        "fileSize": task.fileSize,
+        "speed": speed,
+        "createdAt": task.createdAt,
+        "canPause": task.canPause,
+        "canOpenFile": outputPath.exists(),
+        "canOpenFolder": outputPath.parent.exists(),
+        "fileExt": outputPath.suffix.lstrip(".").lower(),
+        "packName": task.packId,
+    }
+
+
 class BrowserService(QObject):
     pairRequested = Signal(object)
     taskDraftRequested = Signal(list)
     extensionUpdated = Signal(str)
     connectionChanged = Signal()
     protocolMismatched = Signal()
-
-    _wsConnected = Signal(object)
-    _wsDisconnected = Signal(object)
-    _wsMessageReceived = Signal(object, str)
 
     def __init__(self, coroutineRunner, taskService, parse, parent=None):
         super().__init__(parent)
@@ -136,10 +200,6 @@ class BrowserService(QObject):
         self._snapshotTimer.setInterval(1000)
         self._snapshotTimer.timeout.connect(self._broadcastSnapshots)
         self._isUpdatingExtension = False
-
-        self._wsConnected.connect(self._onWsConnected)
-        self._wsDisconnected.connect(self._onWsDisconnected)
-        self._wsMessageReceived.connect(self._onWsMessageReceived)
 
     @property
     def token(self) -> str:
@@ -180,7 +240,8 @@ class BrowserService(QObject):
             return
         sock.setblocking(False)
         self._boundPort = sock.getsockname()[1]
-        self._serveWorkId = self._coroutineRunner.submit(self._run(sock))
+        self._serveWorkId = self._coroutineRunner.submit(
+            self._run(sock), failed=self._onServeFailed)
         logger.info("Browser extension server started on port {}", self._boundPort)
         self._snapshotTimer.start()
 
@@ -191,6 +252,12 @@ class BrowserService(QObject):
             self._coroutineRunner.cancel(self._serveWorkId)
             self._serveWorkId = None
         self._boundPort = 0
+
+    def _onServeFailed(self, error) -> None:
+        self._serveWorkId = None
+        self._boundPort = 0
+        self._snapshotTimer.stop()
+        logger.error("Browser extension server crashed: {}", error)
 
     def setEnabled(self, enabled: bool) -> None:
         if enabled:
@@ -216,81 +283,21 @@ class BrowserService(QObject):
         })
 
     async def _run(self, sock: socket.socket) -> None:
-        async with websockets.serve(self._onConnection, sock=sock):
-            await asyncio.Future()
+        try:
+            server = await websockets.serve(self._onConnection, sock=sock)
+        except Exception:
+            sock.close()
+            raise
+        async with server:
+            await server.serve_forever()
 
     async def _onConnection(self, ws) -> None:
-        self._wsConnected.emit(ws)
+        self._coroutineRunner.post(self._onConnected, ws)
         try:
             async for message in ws:
-                self._wsMessageReceived.emit(ws, message)
+                self._coroutineRunner.post(self._onMessageReceived, ws, message)
         finally:
-            self._wsDisconnected.emit(ws)
-
-    def _toResourceTaskOptions(self, resource: dict) -> ResourceTaskOptions:
-        from app.models.task import ResourceTaskOptions
-        hdrs = resource.get("headers") or {}
-        return ResourceTaskOptions(
-            url=toStr(resource, "url"),
-            name=toStr(resource, "filename"),
-            size=toInt(resource, "size", 0),
-            canUseRangeRequests=bool(resource.get("supportsRange")),
-            headers=hdrs,
-            sourceUserAgent=hdrs.get("user-agent", ""),
-        )
-
-    def _toTaskOptions(self, source: TaskSource, payload: dict) -> TaskOptions:
-        rawPath = payload.get("path")
-        outputFolder = Path(rawPath) if rawPath else Path(cfg.downloadFolder.value)
-
-        match source:
-            case TaskSource.RESOURCE_MERGE:
-                resources = payload.get("resources") or []
-                video = self._toResourceTaskOptions(resources[0]) if len(resources) > 0 else None
-                audio = self._toResourceTaskOptions(resources[1]) if len(resources) > 1 else None
-                return MergeTaskOptions(
-                    url=video.url if video else "",
-                    outputFolder=outputFolder,
-                    video=video,
-                    audio=audio,
-                )
-            case TaskSource.PAGE_MEDIA:
-                hdrs = payload.get("headers") or {}
-                return PageTaskOptions(
-                    url=toStr(payload, "url"),
-                    outputFolder=outputFolder,
-                    pageUrl=toStr(payload, "pageUrl"),
-                    pageTitle=toStr(payload, "pageTitle"),
-                    headers=hdrs,
-                    sourceUserAgent=hdrs.get("user-agent", ""),
-                )
-            case TaskSource.RESOURCE | TaskSource.DOWNLOAD:
-                return replace(
-                    self._toResourceTaskOptions(payload),
-                    outputFolder=outputFolder,
-                    subworkerCount=toInt(payload, "preBlockNum", cfg.preBlockNum.value),
-                )
-            case _:
-                raise ValueError(f"unsupported task source: {source}")
-
-    def _toTaskSummary(self, task: Task) -> dict:
-        progress, speed, receivedBytes = task.currentSnapshot()
-        outputPath = Path(task.outputPath)
-        return {
-            "taskId": task.taskId,
-            "name": task.name,
-            "status": task.status.name.lower(),
-            "progress": round(progress, 2),
-            "receivedBytes": receivedBytes,
-            "fileSize": task.fileSize,
-            "speed": speed,
-            "createdAt": task.createdAt,
-            "canPause": task.canPause,
-            "canOpenFile": outputPath.exists(),
-            "canOpenFolder": outputPath.parent.exists(),
-            "fileExt": outputPath.suffix.lstrip(".").lower(),
-            "packName": task.packId,
-        }
+            self._coroutineRunner.post(self._onDisconnected, ws)
 
     def _closeAll(self) -> None:
         hadAuthenticated = any(s.isAuthenticated for s in self._sessions.values())
@@ -337,12 +344,10 @@ class BrowserService(QObject):
             payload["message"] = message
         self._send(session, payload)
 
-    @Slot(object)
-    def _onWsConnected(self, ws) -> None:
+    def _onConnected(self, ws) -> None:
         self._sessions[ws] = BrowserClientSession(ws=ws)
 
-    @Slot(object)
-    def _onWsDisconnected(self, ws) -> None:
+    def _onDisconnected(self, ws) -> None:
         session = self._sessions.pop(ws, None)
         if session is None:
             return
@@ -356,7 +361,7 @@ class BrowserService(QObject):
         tasks = sorted(self._taskService.tasks, key=lambda t: t.createdAt, reverse=True)
         snapshot = json.dumps({
             "type": MessageType.TASK_SNAPSHOT,
-            "tasks": [self._toTaskSummary(t) for t in tasks],
+            "tasks": [toTaskSummary(t) for t in tasks],
         }, ensure_ascii=False)
 
         for session in list(self._sessions.values()):
@@ -370,8 +375,7 @@ class BrowserService(QObject):
             except Exception as e:
                 logger.opt(exception=e).warning("Failed to push task snapshot")
 
-    @Slot(object, str)
-    def _onWsMessageReceived(self, ws, message: str) -> None:
+    def _onMessageReceived(self, ws, message: str) -> None:
         session = self._sessions.get(ws)
         if session is None:
             return
@@ -493,7 +497,7 @@ class BrowserService(QObject):
             return
 
         try:
-            options = self._toTaskOptions(source, payload)
+            options = toTaskOptions(source, payload)
         except Exception as e:
             self._sendCreateTaskResult(session, requestId, CreateTaskStatus.REJECTED, message=repr(e))
             return
