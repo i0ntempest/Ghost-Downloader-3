@@ -14,7 +14,8 @@ from typing import Any, TYPE_CHECKING
 
 import websockets
 
-from PySide6.QtCore import QObject, QResource, QTimer, QVersionNumber, Signal, Slot
+from PySide6.QtCore import QObject, QResource, QVersionNumber
+from app.signal import Signal
 from loguru import logger
 
 from app.config.cfg import cfg
@@ -196,9 +197,7 @@ class BrowserService(QObject):
         self._serveWorkId: str | None = None
         self._boundPort = 0
         self._sessions: dict[object, BrowserClientSession] = {}
-        self._snapshotTimer = QTimer(self)
-        self._snapshotTimer.setInterval(1000)
-        self._snapshotTimer.timeout.connect(self._broadcastSnapshots)
+        self._snapshotWorkId: str | None = None
         self._isUpdatingExtension = False
 
     @property
@@ -243,10 +242,13 @@ class BrowserService(QObject):
         self._serveWorkId = self._coroutineRunner.submit(
             self._run(sock), failed=self._onServeFailed)
         logger.info("Browser extension server started on port {}", self._boundPort)
-        self._snapshotTimer.start()
+        self._snapshotWorkId = self._coroutineRunner.submit(
+            self._broadcastLoop(), failed=self._onBroadcastFailed)
 
     def stop(self) -> None:
-        self._snapshotTimer.stop()
+        if self._snapshotWorkId is not None:
+            self._coroutineRunner.cancel(self._snapshotWorkId)
+            self._snapshotWorkId = None
         self._closeAll()
         if self._serveWorkId is not None:
             self._coroutineRunner.cancel(self._serveWorkId)
@@ -256,8 +258,14 @@ class BrowserService(QObject):
     def _onServeFailed(self, error) -> None:
         self._serveWorkId = None
         self._boundPort = 0
-        self._snapshotTimer.stop()
+        if self._snapshotWorkId is not None:
+            self._coroutineRunner.cancel(self._snapshotWorkId)
+            self._snapshotWorkId = None
         logger.error("Browser extension server crashed: {}", error)
+
+    def _onBroadcastFailed(self, error) -> None:
+        self._snapshotWorkId = None
+        logger.error("Snapshot broadcast loop crashed: {}", error)
 
     def setEnabled(self, enabled: bool) -> None:
         if enabled:
@@ -281,6 +289,11 @@ class BrowserService(QObject):
             "ok": False,
             "message": "已拒绝配对请求",
         })
+
+    async def _broadcastLoop(self) -> None:
+        while True:
+            await asyncio.sleep(1)
+            self._coroutineRunner.post(self._broadcastSnapshots)
 
     async def _run(self, sock: socket.socket) -> None:
         try:
@@ -354,7 +367,6 @@ class BrowserService(QObject):
         if session.isAuthenticated:
             self.connectionChanged.emit()
 
-    @Slot()
     def _broadcastSnapshots(self) -> None:
         if not self._sessions:
             return

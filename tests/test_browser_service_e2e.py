@@ -79,7 +79,7 @@ def startOnFreePort(service):
     sock.setblocking(False)
     service._boundPort = sock.getsockname()[1]
     service._serveWorkId = service._coroutineRunner.submit(service._run(sock))
-    service._snapshotTimer.start()
+    service._snapshotWorkId = service._coroutineRunner.submit(service._broadcastLoop())
 
 
 class TestBrowserServiceE2E:

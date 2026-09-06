@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, Signal
+from app.signal import Signal
 
 from app.models.task import TaskError, toTaskError
 
@@ -26,11 +26,10 @@ class RuntimeStatus:
     progress: float = 0
 
 
-class RuntimeStatusService(QObject):
+class RuntimeStatusService:
     statusChanged = Signal(object)
 
     def __init__(self, coroutineRunner, parent=None):
-        super().__init__(parent)
         self._coroutineRunner = coroutineRunner
         self._statuses: dict[str, RuntimeStatus] = {}
         self._workIds: dict[str, str] = {}

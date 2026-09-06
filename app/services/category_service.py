@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
-from PySide6.QtCore import QObject, Signal
+from app.signal import Signal
 
 from app.config.cfg import cfg
 
@@ -127,11 +127,10 @@ class Category:
         )
 
 
-class CategoryService(QObject):
+class CategoryService:
     categoriesChanged = Signal()
 
     def __init__(self) -> None:
-        super().__init__()
         self._categories: list[Category] = []
         self._load()
 

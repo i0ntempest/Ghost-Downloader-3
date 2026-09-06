@@ -89,14 +89,8 @@ class StubCategoryService:
 
 class StubSpeedMeter:
     def __init__(self):
-        from PySide6.QtCore import Signal, QObject
-        class _Obj(QObject):
-            speedChanged = Signal(int)
-        self._obj = _Obj()
-
-    @property
-    def speedChanged(self):
-        return self._obj.speedChanged
+        from app.signal import BoundSignal
+        self.speedChanged = BoundSignal()
 
 
 class TestRunningIds:

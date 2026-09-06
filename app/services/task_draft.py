@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, TYPE_CHECKING
 
-from PySide6.QtCore import QObject, Signal
+from app.signal import Signal
 from loguru import logger
 
 from app.models.task import toTaskError
@@ -23,7 +23,7 @@ class DraftItem:
     confirmedAutoStart: bool = True
 
 
-class TaskDraft(QObject):
+class TaskDraft:
     parsingBusyChanged = Signal(bool)
     parseSucceeded = Signal(str, object)
     parseFailed = Signal(str, object)
@@ -32,7 +32,6 @@ class TaskDraft(QObject):
     taskConfirmed = Signal(object, bool)
 
     def __init__(self, coroutineRunner, featureService, parent=None):
-        super().__init__(parent)
         self._coroutineRunner = coroutineRunner
         self._featureService = featureService
         self._items: list[DraftItem] = []

@@ -30,7 +30,7 @@ def loadEngine(application):
 
     coroutineRunner = CoroutineRunner(parent=application)
     categoryService = CategoryService()
-    speedMeter = SpeedMeter(parent=application)
+    speedMeter = SpeedMeter(coroutineRunner)
 
     coroutineRunner.start()
 

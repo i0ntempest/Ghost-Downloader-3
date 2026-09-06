@@ -8,7 +8,7 @@ from pathlib import Path
 from secrets import token_hex
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QObject, Signal
+from app.signal import Signal
 from loguru import logger
 
 from app.config.cfg import cfg
@@ -22,11 +22,10 @@ JSONRPC_INVALID_REQUEST = -32600
 JSONRPC_METHOD_NOT_FOUND = -32601
 
 
-class Aria2RpcServer(QObject):
+class Aria2RpcServer:
     taskDraftRequested = Signal(list)
 
-    def __init__(self, coroutineRunner, parse, addTask, parent: QObject | None = None) -> None:
-        super().__init__(parent)
+    def __init__(self, coroutineRunner, parse, addTask, parent=None) -> None:
         self._coroutineRunner = coroutineRunner
         self._parse = parse
         self._addTask = addTask

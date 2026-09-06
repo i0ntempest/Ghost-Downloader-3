@@ -13,7 +13,7 @@ from enum import auto, IntEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, Signal
+from app.signal import Signal
 from loguru import logger
 
 from app.config.constants import VERSION
@@ -112,11 +112,10 @@ class UpdateInfo:
     error: TaskError | None = None
 
 
-class UpdateService(QObject):
+class UpdateService:
     changed = Signal(object)
 
     def __init__(self, coroutineRunner: CoroutineRunner, parent=None):
-        super().__init__(parent)
         self._coroutineRunner = coroutineRunner
         self._infos: dict[str, UpdateInfo] = {}
         self._versionsData: dict = {}
