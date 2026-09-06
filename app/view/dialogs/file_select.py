@@ -30,7 +30,7 @@ class FileSelectDialog(MessageBoxBase):
 
         self.titleLabel = SubtitleLabel(self.tr("选择下载文件"), self)
         self.summaryLabel = BodyLabel("", self)
-        self.treeView = AutoSizingTreeView(self, minimumVisibleRows=3, maximumVisibleRows=16)
+        self.treeView = AutoSizingTreeView(self, minimumVisibleRows=3)
         self.treeModel = QStandardItemModel(self.treeView)
 
         self.selectAllButton = PrimaryPushButton(self.tr("全选"), self)

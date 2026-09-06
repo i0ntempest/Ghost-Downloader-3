@@ -22,7 +22,7 @@ class SubtitleSelectDialog(MessageBoxBase):
         self.selectAllButton = PrimaryPushButton(self.tr("全选"), self)
         self.clearButton = PushButton(self.tr("全不选"), self)
 
-        self.treeView = AutoSizingTreeView(self, minimumVisibleRows=3, maximumVisibleRows=16)
+        self.treeView = AutoSizingTreeView(self, minimumVisibleRows=3)
         self.treeModel = QStandardItemModel(self.treeView)
 
         self._initWidget(set(selected))

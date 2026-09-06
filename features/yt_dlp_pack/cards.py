@@ -223,7 +223,7 @@ class VideoSelectDialog(MessageBoxBase):
         self.clearButton = PushButton(self.tr("全不选"), self)
         self.invertButton = PushButton(self.tr("反选"), self)
 
-        self.treeView = AutoSizingTreeView(self, minimumVisibleRows=3, maximumVisibleRows=16)
+        self.treeView = AutoSizingTreeView(self, minimumVisibleRows=3)
         self.treeModel = QStandardItemModel(self.treeView)
 
         self._initWidget()
