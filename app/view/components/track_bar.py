@@ -96,6 +96,8 @@ class TrackBar(QWidget):
         self.videoButton.setToolTip(self.tr("视频"))
         self.audioButton = MenuTrackButton(FluentIcon.HEADPHONE, self)
         self.audioButton.setToolTip(self.tr("音频"))
+        self.audioLanguageButton = TrackButton(FluentIcon.MICROPHONE, self)
+        self.audioLanguageButton.setToolTip(self.tr("音频语言"))
         self.subtitleButton = TrackButton(FluentIcon.LANGUAGE, self)
         self.subtitleButton.setToolTip(self.tr("字幕"))
         self.coverButton = TrackButton(FluentIcon.PHOTO, self)
@@ -112,6 +114,7 @@ class TrackBar(QWidget):
         layout.addWidget(self.spinner)
         layout.addWidget(self.videoButton)
         layout.addWidget(self.audioButton)
+        layout.addWidget(self.audioLanguageButton)
         layout.addWidget(self.subtitleButton)
         layout.addWidget(self.coverButton)
 

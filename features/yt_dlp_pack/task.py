@@ -118,6 +118,20 @@ def buildFormatPair(info: dict, task: YouTubeTask) -> tuple[dict | None, dict | 
         and f.get("vcodec", "none") == "none"
     ]
 
+    primaryLang = next((s.strip() for s in task.audioLanguages.split(",") if s.strip()), "")
+    if primaryLang:
+        langFormats = [f for f in audioFormats if f.get("language") == primaryLang]
+        if langFormats:
+            audioFormats = langFormats
+        else:
+            logger.warning("audio language '{}' not available, falling back to original", primaryLang)
+            origFormats = [f for f in audioFormats if (f.get("language_preference") or 0) >= 10]
+            audioFormats = origFormats or audioFormats
+    else:
+        origFormats = [f for f in audioFormats if (f.get("language_preference") or 0) >= 10]
+        if origFormats:
+            audioFormats = origFormats
+
     if task.maxAudioBitrate > 0:
         audioFormats = [f for f in audioFormats
                        if (f.get("abr") or f.get("tbr") or 0) <= task.maxAudioBitrate]
@@ -189,6 +203,7 @@ class YouTubeTask(Task):
     maxAudioBitrate: int = 0
     isVideoEnabled: bool = True
     isAudioEnabled: bool = True
+    audioLanguages: str = ""
     subtitleLanguages: str = ""
     shouldIncludeAutoSubs: bool = False
     coverUrl: str = ""
@@ -386,9 +401,12 @@ class YouTubeExtractStep(TaskStep):
             step.httpByteOffset = segRange.segStart
             step.fileSize = segRange.segEnd - segRange.segStart
 
+            stepLang = step.language
             for mergeStep in self.task.steps:
-                if isinstance(mergeStep, YouTubeMergeStep) and mergeStep.fileIndex == self.fileIndex:
-                    if step.role == "video":
+                if (isinstance(mergeStep, YouTubeMergeStep)
+                        and mergeStep.fileIndex == self.fileIndex
+                        and mergeStep.language == stepLang):
+                    if step.role == "video" and not stepLang:
                         mergeStep.patchedVideoHeader = segRange.patchedHeader
                     else:
                         mergeStep.patchedAudioHeader = segRange.patchedHeader
@@ -408,6 +426,8 @@ class YouTubeExtractStep(TaskStep):
         for step in self.task.steps:
             if step.fileIndex != self.fileIndex:
                 continue
+            if isinstance(step, YouTubeResourceStep) and step.language:
+                continue
             if isinstance(step, FFmpegResourceStep):
                 fmt = videoFmt if step.role == "video" else audioFmt
                 if not fmt:
@@ -419,7 +439,7 @@ class YouTubeExtractStep(TaskStep):
                 step.canUseRangeRequests = True
                 step.subworkerCount = cfg.preBlockNum.value
                 step.headers = dict(fmt.get("http_headers") or {})
-            elif isinstance(step, YouTubeMergeStep):
+            elif isinstance(step, YouTubeMergeStep) and not step.language:
                 step.videoExtension = videoFmt.get("ext", "mp4") if videoFmt else ""
                 step.audioExtension = audioFmt.get("ext", "m4a") if audioFmt else ""
                 if ytDlpConfig.shouldEmbedMetadata.value:
@@ -428,21 +448,113 @@ class YouTubeExtractStep(TaskStep):
                 if ytDlpConfig.shouldEmbedChapters.value:
                     step.chapters = info.get("chapters") or []
 
+        self._updateExtraAudioSteps(info, cfg.preBlockNum.value)
+
         totalSize = sum(
             s.fileSize for s in self.task.steps
             if isinstance(s, FFmpegResourceStep) and self.task._isStepSelected(s)
         )
         self.task.fileSize = totalSize if totalSize > 0 else 0
 
+    def _updateExtraAudioSteps(self, info: dict, subworkerCount: int) -> None:
+        if not self.task.isAudioEnabled:
+            return
+
+        from .config import ytDlpConfig
+
+        allLangs = [s.strip() for s in self.task.audioLanguages.split(",") if s.strip()]
+        extraLangs = allLangs[1:]
+        if not extraLangs:
+            return
+
+        formats = [f for f in (info.get("formats") or []) if f.get("protocol") in DIRECT_PROTOCOLS]
+        audioFormats = [
+            f for f in formats
+            if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"
+        ]
+        shouldPreferMp4 = ytDlpConfig.shouldPreferMp4.value
+
+        existingLangs = {
+            s.language for s in self.task.steps
+            if isinstance(s, YouTubeResourceStep) and s.language and s.fileIndex == self.fileIndex
+        }
+
+        maxStepIndex = max((s.stepIndex for s in self.task.steps), default=0)
+
+        for lang in extraLangs:
+            langFormats = [f for f in audioFormats if f.get("language") == lang]
+            if not langFormats:
+                logger.warning("audio language '{}' not available for extra track, skipping", lang)
+                continue
+
+            langFormats.sort(
+                key=lambda f: (
+                    shouldPreferMp4 and f.get("ext") in ("mp4", "m4a"),
+                    f.get("abr") or f.get("tbr") or 0,
+                ),
+                reverse=True,
+            )
+            fmt = langFormats[0]
+
+            if lang in existingLangs:
+                for s in self.task.steps:
+                    if isinstance(s, YouTubeResourceStep) and s.language == lang and s.fileIndex == self.fileIndex:
+                        s.url = fmt["url"]
+                        s.fileSize = fmt.get("filesize") or fmt.get("filesize_approx") or 0
+                        s.extension = fmt.get("ext") or "m4a"
+                        s.headers = dict(fmt.get("http_headers") or {})
+                        break
+                hasMerge = any(
+                    isinstance(s, YouTubeMergeStep) and s.language == lang and s.fileIndex == self.fileIndex
+                    for s in self.task.steps
+                )
+                if not hasMerge:
+                    maxStepIndex += 1
+                    self.task.addStep(YouTubeMergeStep(
+                        stepIndex=maxStepIndex, fileIndex=self.fileIndex,
+                        videoStem="", language=lang, audioExtension=fmt.get("ext") or "m4a",
+                    ))
+                continue
+
+            maxStepIndex += 1
+            resourceStep = YouTubeResourceStep(
+                stepIndex=maxStepIndex,
+                fileIndex=self.fileIndex,
+                videoStem="",
+                role="audio",
+                language=lang,
+                url=fmt["url"],
+                fileSize=fmt.get("filesize") or fmt.get("filesize_approx") or 0,
+                extension=fmt.get("ext") or "m4a",
+                canUseRangeRequests=True,
+                subworkerCount=subworkerCount,
+                headers=dict(fmt.get("http_headers") or {}),
+            )
+            self.task.addStep(resourceStep)
+
+            maxStepIndex += 1
+            mergeStep = YouTubeMergeStep(
+                stepIndex=maxStepIndex,
+                fileIndex=self.fileIndex,
+                videoStem="",
+                language=lang,
+                audioExtension=fmt.get("ext") or "m4a",
+            )
+            self.task.addStep(mergeStep)
+
 
 @dataclass(kw_only=True)
 class YouTubeResourceStep(FFmpegResourceStep):
     fileIndex: int = 0
     videoStem: str = ""
+    language: str = ""
 
     @property
     def outputPath(self) -> str:
         stem = self.videoStem or mediaStem(self.task)
+        if self.language:
+            suffix = f".{self.extension}" if self.extension else ".m4a"
+            return str(self.task.outputFolder / f"{stem}.{self.language}.audio{suffix}")
         suffix = f".{self.extension}" if self.extension else ""
         return str(self.task.outputFolder / f"{stem}.{self.role}{suffix}")
 
@@ -545,6 +657,7 @@ class YouTubeMergeStep(FFmpegStep):
     fileIndex: int = 0
     videoUrl: str = ""
     videoStem: str = ""
+    language: str = ""
     metadataTitle: str = ""
     metadataArtist: str = ""
     chapters: list[dict] = field(default_factory=list)
@@ -555,6 +668,9 @@ class YouTubeMergeStep(FFmpegStep):
     @property
     def outputFile(self) -> str:
         stem = self.videoStem or mediaStem(self.task)
+        if self.language:
+            ext = self.audioExtension or "m4a"
+            return str(self.task.outputFolder / f"{stem}.{self.language}.{ext}")
         ext = "mp4" if self.videoExtension else (self.audioExtension or "m4a")
         return str(self.task.outputFolder / f"{stem}.{ext}")
 
@@ -567,6 +683,9 @@ class YouTubeMergeStep(FFmpegStep):
     @property
     def _audioPath(self) -> Path:
         stem = self.videoStem or mediaStem(self.task)
+        if self.language:
+            suffix = f".{self.audioExtension}" if self.audioExtension else ".m4a"
+            return self.task.outputFolder / f"{stem}.{self.language}.audio{suffix}"
         suffix = f".{self.audioExtension}" if self.audioExtension else ""
         return self.task.outputFolder / f"{stem}.audio{suffix}"
 

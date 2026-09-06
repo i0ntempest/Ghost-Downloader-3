@@ -22,7 +22,7 @@ from app.view.components.track_bar import TrackBar, TrackButton
 from app.view.components.tree_view import AutoSizingTreeView
 from app.view.dialogs.subtitle_select import SubtitleSelectDialog
 from .config import ytDlpConfig
-from .task import STEPS_PER_VIDEO, YouTubeCoverStep, YouTubeTask, buildFormatPair, probeFormats, probePlaylist
+from .task import DIRECT_PROTOCOLS, STEPS_PER_VIDEO, YouTubeCoverStep, YouTubeTask, buildFormatPair, probeFormats, probePlaylist
 
 
 def toCodecName(codec: str) -> str:
@@ -142,6 +142,33 @@ def buildSubtitleChoices(mediaInfo: dict, automaticLabel: str) -> tuple[list[tup
             choices.append((lang, f"{lang} ({automaticLabel})"))
 
     return choices, autoLangs
+
+
+def buildAudioLanguageChoices(mediaInfo: dict) -> list[tuple[str, str]]:
+    formats = mediaInfo.get("formats") or []
+    seen: dict[str, tuple[str, int]] = {}
+
+    for f in formats:
+        if f.get("acodec", "none") == "none" or f.get("vcodec", "none") != "none":
+            continue
+        if f.get("protocol") not in DIRECT_PROTOCOLS:
+            continue
+        lang = f.get("language")
+        if not lang or lang in seen:
+            continue
+        note = f.get("format_note") or ""
+        comma = note.find(",")
+        displayName = note[:comma].strip() if comma >= 0 else note.strip()
+        pref = f.get("language_preference") or 0
+        if not displayName:
+            displayName = f"{lang} (Original)" if pref >= 10 else lang
+        seen[lang] = (displayName, pref)
+
+    if len(seen) <= 1:
+        return []
+
+    items = sorted(seen.items(), key=lambda kv: (-kv[1][1], kv[1][0]))
+    return [(lang, displayName) for lang, (displayName, _) in items]
 
 
 STEP_LABELS = {
@@ -351,10 +378,16 @@ class YtDlpDraftCard(DraftCard):
         self._trackBar = TrackBar(self)
         self._subtitleChoices: list[tuple[str, str]] = []
         self._autoLangs: set[str] = set()
+        self._audioLanguageChoices: list[tuple[str, str]] = []
 
         if hasMediaInfo:
             self._trackBar.videoButton.setOptions(buildVideoTiers(mediaInfo, self.tr("最佳画质")))
             self._trackBar.audioButton.setOptions(buildAudioTiers(mediaInfo, self.tr("最佳音质")))
+            self._audioLanguageChoices = buildAudioLanguageChoices(mediaInfo)
+            self._trackBar.audioLanguageButton.setTrackEnabled(bool(self._audioLanguageChoices))
+            if self._audioLanguageChoices and not task.audioLanguages:
+                task.audioLanguages = self._audioLanguageChoices[0][0]
+                self._trackBar.audioLanguageButton.setChecked(True)
             choices, autoLangs = buildSubtitleChoices(mediaInfo, self.tr("自动"))
             self._subtitleChoices = choices
             self._autoLangs = autoLangs
@@ -366,6 +399,7 @@ class YtDlpDraftCard(DraftCard):
         else:
             self._trackBar.videoButton.setOptions([("0", self.tr("最佳画质"))])
             self._trackBar.audioButton.setOptions([("0", self.tr("最佳音质"))])
+            self._trackBar.audioLanguageButton.setTrackEnabled(False)
             self._trackBar.subtitleButton.setTrackEnabled(False)
             self._trackBar.coverButton.setTrackEnabled(False)
             self._trackBar.spinner.show()
@@ -413,6 +447,7 @@ class YtDlpDraftCard(DraftCard):
         self._trackBar.videoButton.toggled.connect(self._onTrackToggled)
         self._trackBar.audioButton.optionPicked.connect(self._onAudioQualityPicked)
         self._trackBar.audioButton.toggled.connect(self._onTrackToggled)
+        self._trackBar.audioLanguageButton.clicked.connect(self._onAudioLanguageClicked)
         self._trackBar.subtitleButton.clicked.connect(self._onSubtitleClicked)
         self._trackBar.coverButton.clicked.connect(
             lambda: self._trackBar.coverButton.setChecked(not self._trackBar.coverButton.isChecked())
@@ -439,6 +474,10 @@ class YtDlpDraftCard(DraftCard):
         self._refreshSummary()
 
         hasMedia = task.isVideoEnabled or task.isAudioEnabled
+        audioLangEnabled = task.isAudioEnabled and bool(self._audioLanguageChoices)
+        self._trackBar.audioLanguageButton.setTrackEnabled(audioLangEnabled)
+        if audioLangEnabled:
+            self._trackBar.audioLanguageButton.setChecked(bool(task.audioLanguages.strip()))
         subtitleEnabled = hasMedia and bool(self._subtitleChoices)
         self._trackBar.subtitleButton.setTrackEnabled(subtitleEnabled)
         if subtitleEnabled:
@@ -486,6 +525,19 @@ class YtDlpDraftCard(DraftCard):
         self._task.maxAudioBitrate = int(value)
         self._refreshSummary()
 
+    def _onAudioLanguageClicked(self) -> None:
+        currentLangs = [s.strip() for s in self._task.audioLanguages.split(",") if s.strip()]
+        dialog = SubtitleSelectDialog(self._audioLanguageChoices, currentLangs, self.window())
+        dialog.titleLabel.setText(self.tr("选择音频语言"))
+        try:
+            if dialog.exec():
+                selected = dialog.selectedLanguages()
+                self._task.audioLanguages = ",".join(selected)
+                self._trackBar.audioLanguageButton.setChecked(bool(selected))
+                self._refreshSummary()
+        finally:
+            dialog.deleteLater()
+
     def _refreshSummary(self) -> None:
         task: YouTubeTask = self._task
         mediaInfo = getattr(task, "_mediaInfo", None)
@@ -520,6 +572,11 @@ class YtDlpDraftCard(DraftCard):
 
         self._trackBar.videoButton.setOptions(buildVideoTiers(mediaInfo, self.tr("最佳画质")))
         self._trackBar.audioButton.setOptions(buildAudioTiers(mediaInfo, self.tr("最佳音质")))
+        self._audioLanguageChoices = buildAudioLanguageChoices(mediaInfo)
+        self._trackBar.audioLanguageButton.setTrackEnabled(bool(self._audioLanguageChoices))
+        if self._audioLanguageChoices and not task.audioLanguages:
+            task.audioLanguages = self._audioLanguageChoices[0][0]
+            self._trackBar.audioLanguageButton.setChecked(True)
 
         choices, autoLangs = buildSubtitleChoices(mediaInfo, self.tr("自动"))
         self._subtitleChoices = choices
